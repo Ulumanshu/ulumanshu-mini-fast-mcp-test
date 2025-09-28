@@ -343,62 +343,49 @@ def create_server() -> FastMCP:
         return {"count": len(rows), "parcels": rows}
 
     @mcp.tool()
-    async def parcel_latest_full(parcel_id: str, report_id: str) -> Dict[str, Any]:
+    async def parcel_latest_full(parcel_id: str, report_id: str, limit: Optional[int] = None) -> Dict[str, Any]:
         """
-        For a given parcel_id (stored in `value`) and a report_id:
-          - Best-effort verify the parcel/report pair exists in the table
-          - Return ALL fields/layers for that report (Databricks SQL only)
+        Single-query version:
+          SELECT * FROM test.gold.gold_report
+          WHERE report_id = ? AND value = ?
+          ORDER BY layerId, fieldId
+        - Transforms `attributes` to a string (JSON if possible).
+        - Minimally stringifies non-JSON-native types to avoid serialization issues.
         """
+        sql = f"""
+               SELECT *
+               FROM {GOLD_REPORT_TABLE}
+               WHERE {COL_REPORT_ID} = ? AND value = ?
+               ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
+           """
+        rows = await asyncio.to_thread(_db_query_dicts, sql, (report_id, parcel_id))
 
-        # Optional: verify that this report contains a row for the parcel_id (via value column)
-        sql_verify = f"""
-            SELECT 1
-            FROM {GOLD_REPORT_TABLE}
-            WHERE {COL_REPORT_ID} = ?
-              AND value = ?
-            LIMIT 1
-        """
-        verify = _db_query_dicts(sql_verify, (report_id, parcel_id))
-        warning = None if verify else f"parcel_id '{parcel_id}' not found in report_id '{report_id}' (value column)."
+        out: List[Dict[str, Any]] = []
+        for r in (rows[: int(limit)] if limit else rows):
+            rr = dict(r)
 
-        # Pull a representative createDate for the report (max across rows in that report)
-        sql_report_date = f"""
-            SELECT MAX({COL_CREATE_DATE}) AS createDate
-            FROM {GOLD_REPORT_TABLE}
-            WHERE {COL_REPORT_ID} = ?
-        """
-        date_row = _db_query_dicts(sql_report_date, (report_id,))
-        created_at = (date_row[0]["createDate"] if date_row and "createDate" in date_row[0] else None)
+            # attributes -> string (prefer JSON string)
+            a = rr.get("attributes")
+            if not isinstance(a, str):
+                try:
+                    rr["attributes"] = json.dumps(a, default=str)
+                except Exception:
+                    rr["attributes"] = "" if a is None else str(a)
 
-        # Return ALL fields/layers for that report
-        sql_fields = f"""
-            SELECT
-                {COL_LAYER_ID} AS layerId,
-                {COL_FIELD_ID} AS fieldId,
-                description,
-                value,
-                attributes
-            FROM {GOLD_REPORT_TABLE}
-            WHERE {COL_REPORT_ID} = ?
-            ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
-        """
-        rows = _db_query_dicts(sql_fields, (report_id,))
+            # minimal JSON-safety for other cols
+            for k, v in list(rr.items()):
+                if k == "attributes":
+                    continue
+                if isinstance(v, (datetime, date, decimal.Decimal, bytes, bytearray)):
+                    rr[k] = str(v)
 
-        # best-effort: parse JSON attributes if they are strings
-        for r in rows:
-            try:
-                if isinstance(r.get("attributes"), str):
-                    r["attributes"] = json.loads(r["attributes"])
-            except Exception:
-                pass
+            out.append(rr)
 
         return {
             "parcel_id": parcel_id,
             "report_id": report_id,
-            "createDate": created_at,
-            "field_count": len(rows),
-            "fields": rows,
-            **({"warning": warning} if warning else {}),
+            "count": len(out),
+            "rows": out,
         }
 
     return mcp
