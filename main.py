@@ -344,49 +344,89 @@ def create_server() -> FastMCP:
         return {"count": len(rows), "parcels": rows}
 
     @mcp.tool()
-    async def parcel_latest_full(parcel_id: str, report_id: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    async def parcel_latest_full(
+            parcel_id: str,
+            report_id: str,
+            limit: Optional[int] = 200,
+            offset: Optional[int] = 0,
+            byte_budget_kb: Optional[int] = 512,
+    ) -> Dict[str, Any]:
         """
-        Single-query version:
+        Single-query, size-capped:
           SELECT * FROM test.gold.gold_report
           WHERE report_id = ? AND value = ?
           ORDER BY layerId, fieldId
-        - Transforms `attributes` to a string (JSON if possible).
-        - Minimally stringifies non-JSON-native types to avoid serialization issues.
+        - Returns at most `limit` rows (default 200), starting at `offset`
+        - Aborts row accumulation when approx JSON size exceeds `byte_budget_kb` (default 512 KB)
+        - Ensures `attributes` is a string; stringifies non-JSON-native types
         """
+        # Clamp inputs defensively
+        safe_limit = int(limit or 200)
+        safe_limit = max(1, min(safe_limit, 5000))
+        safe_offset = int(offset or 0)
+        safe_offset = max(0, safe_offset)
+        budget_bytes = int(byte_budget_kb or 512) * 1024
+        budget_bytes = max(32 * 1024, min(budget_bytes, 8 * 1024 * 1024))  # 32KB..8MB
+
+        # Build SQL with literal LIMIT/OFFSET (many drivers don't bind these well)
         sql = f"""
-               SELECT *
-               FROM {GOLD_REPORT_TABLE}
-               WHERE {COL_REPORT_ID} = ? AND value = ?
-               ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
-           """
+                SELECT *
+                FROM {GOLD_REPORT_TABLE}
+                WHERE {COL_REPORT_ID} = ? AND value = ?
+                ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
+                LIMIT {safe_limit} OFFSET {safe_offset}
+            """
+
         rows = await asyncio.to_thread(_db_query_dicts, sql, (report_id, parcel_id))
 
-        out: List[Dict[str, Any]] = []
-        for r in (rows[: int(limit)] if limit else rows):
+        # Transform rows and enforce byte budget
+        out_rows: List[Dict[str, Any]] = []
+        approx = 0
+
+        for r in rows:
             rr = dict(r)
 
             # attributes -> string (prefer JSON string)
             a = rr.get("attributes")
             if not isinstance(a, str):
                 try:
-                    rr["attributes"] = json.dumps(a, default=str)
+                    rr["attributes"] = json.dumps(a, default=str, ensure_ascii=False)
                 except Exception:
                     rr["attributes"] = "" if a is None else str(a)
 
-            # minimal JSON-safety for other cols
+            # Minimal safety for other columns (timestamps/decimals/bytes etc.)
             for k, v in list(rr.items()):
                 if k == "attributes":
                     continue
                 if isinstance(v, (datetime, date, decimal.Decimal, bytes, bytearray)):
                     rr[k] = str(v)
 
-            out.append(rr)
+            # Estimate size if we add this row
+            row_json = json.dumps(rr, ensure_ascii=False)
+            row_bytes = len(row_json.encode("utf-8"))
+
+            # If nothing added yet and a single row exceeds budget, include it anyway
+            # (caller can raise budget if needed)
+            if out_rows and approx + row_bytes > budget_bytes:
+                break
+
+            out_rows.append(rr)
+            approx += row_bytes
+
+        next_offset = safe_offset + len(out_rows)
+        # If we hit either the limit or the budget early, expose a next_offset for paging
+        more_available = len(rows) == safe_limit
 
         return {
             "parcel_id": parcel_id,
             "report_id": report_id,
-            "count": len(out),
-            "rows": out,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "byte_budget_kb": budget_bytes // 1024,
+            "approx_bytes": approx,
+            "rows_returned": len(out_rows),
+            "next_offset": next_offset if more_available else None,
+            "rows": out_rows,
         }
 
     return mcp
