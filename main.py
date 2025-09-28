@@ -347,85 +347,93 @@ def create_server() -> FastMCP:
     async def parcel_latest_full(
             parcel_id: str,
             report_id: str,
-            limit: Optional[int] = 200,
-            offset: Optional[int] = 0,
-            byte_budget_kb: Optional[int] = 512,
     ) -> Dict[str, Any]:
         """
-        Single-query, size-capped:
+        Single query:
           SELECT * FROM test.gold.gold_report
           WHERE report_id = ? AND value = ?
           ORDER BY layerId, fieldId
-        - Returns at most `limit` rows (default 200), starting at `offset`
-        - Aborts row accumulation when approx JSON size exceeds `byte_budget_kb` (default 512 KB)
-        - Ensures `attributes` is a string; stringifies non-JSON-native types
+
+        - Returns a compact payload with rows only.
+        - Post-processing *always* strips any 'geometry' keys from attributes (recursively).
         """
-        # Clamp inputs defensively
-        safe_limit = int(limit or 200)
-        safe_limit = max(1, min(safe_limit, 5000))
-        safe_offset = int(offset or 0)
-        safe_offset = max(0, safe_offset)
-        budget_bytes = int(byte_budget_kb or 512) * 1024
-        budget_bytes = max(32 * 1024, min(budget_bytes, 8 * 1024 * 1024))  # 32KB..8MB
 
-        # Build SQL with literal LIMIT/OFFSET (many drivers don't bind these well)
-        sql = f"""
-                SELECT *
-                FROM {GOLD_REPORT_TABLE}
-                WHERE {COL_REPORT_ID} = ? AND value = ?
-                ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
-                LIMIT {safe_limit} OFFSET {safe_offset}
+        # ---- helpers -----------------------------------------------------------
+        def _strip_geometry(obj):
+            """Recursively remove any key named 'geometry' from dicts/lists."""
+            if isinstance(obj, dict):
+                return {k: _strip_geometry(v) for k, v in obj.items() if k != "geometry"}
+            if isinstance(obj, list):
+                return [_strip_geometry(v) for v in obj]
+            return obj
+
+        def _clean_attributes_to_string(a) -> str:
             """
+            Ensure `attributes` is a JSON string *without* 'geometry'.
+            - If already a JSON string, try to parse -> strip -> re-dump.
+            - If non-JSON or parsing fails, best-effort stringify (sans geometry if possible).
+            """
+            # If it's a string, attempt to parse as JSON first
+            if isinstance(a, str):
+                try:
+                    parsed = json.loads(a)
+                    parsed = _strip_geometry(parsed)
+                    return json.dumps(parsed, ensure_ascii=False)
+                except Exception:
+                    # Not valid JSON; return as-is (can't safely strip geometry)
+                    return a
 
-        rows = await asyncio.to_thread(_db_query_dicts, sql, (report_id, parcel_id))
+            # If it's already a Python structure, strip and dump
+            try:
+                cleaned = _strip_geometry(a)
+                return json.dumps(cleaned, default=str, ensure_ascii=False)
+            except Exception:
+                return "" if a is None else str(a)
 
-        # Transform rows and enforce byte budget
+        # ---- query -------------------------------------------------------------
+        # Guardrail to avoid gigantic responses; raise or remove if you truly need unlimited
+        HARD_LIMIT = 5000
+
+        sql = f"""
+            SELECT *
+            FROM {GOLD_REPORT_TABLE}
+            WHERE {COL_REPORT_ID} = ? AND value = ?
+            ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
+            LIMIT {HARD_LIMIT}
+        """
+
+        try:
+            rows = await asyncio.to_thread(_db_query_dicts, sql, (report_id, parcel_id))
+        except Exception as e:
+            # Surface a clean error back to the caller
+            return {
+                "parcel_id": parcel_id,
+                "report_id": report_id,
+                "rows": [],
+                "error": f"Query failed: {type(e).__name__}: {e}",
+            }
+
+        # ---- post-process (strip geometry; normalize types) --------------------
         out_rows: List[Dict[str, Any]] = []
-        approx = 0
-
         for r in rows:
             rr = dict(r)
 
-            # attributes -> string (prefer JSON string)
-            a = rr.get("attributes")
-            if not isinstance(a, str):
-                try:
-                    rr["attributes"] = json.dumps(a, default=str, ensure_ascii=False)
-                except Exception:
-                    rr["attributes"] = "" if a is None else str(a)
+            # Normalize attributes to JSON string with geometry removed
+            rr["attributes"] = _clean_attributes_to_string(rr.get("attributes"))
 
-            # Minimal safety for other columns (timestamps/decimals/bytes etc.)
+            # Minimal normalization for other non-JSON-native types
             for k, v in list(rr.items()):
                 if k == "attributes":
                     continue
                 if isinstance(v, (datetime, date, decimal.Decimal, bytes, bytearray)):
                     rr[k] = str(v)
 
-            # Estimate size if we add this row
-            row_json = json.dumps(rr, ensure_ascii=False)
-            row_bytes = len(row_json.encode("utf-8"))
-
-            # If nothing added yet and a single row exceeds budget, include it anyway
-            # (caller can raise budget if needed)
-            if out_rows and approx + row_bytes > budget_bytes:
-                break
-
             out_rows.append(rr)
-            approx += row_bytes
 
-        next_offset = safe_offset + len(out_rows)
-        # If we hit either the limit or the budget early, expose a next_offset for paging
-        more_available = len(rows) == safe_limit
-
+        # ---- compact response --------------------------------------------------
         return {
             "parcel_id": parcel_id,
             "report_id": report_id,
-            "offset": safe_offset,
-            "limit": safe_limit,
-            "byte_budget_kb": budget_bytes // 1024,
-            "approx_bytes": approx,
-            "rows_returned": len(out_rows),
-            "next_offset": next_offset if more_available else None,
             "rows": out_rows,
         }
 
