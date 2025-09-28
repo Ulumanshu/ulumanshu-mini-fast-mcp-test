@@ -316,7 +316,7 @@ def create_server() -> FastMCP:
     @mcp.tool()
     async def parcels_latest_unique(limit: Optional[int] = 20) -> Dict[str, Any]:
         """
-        Return latest-unique parcels.
+        Return latest-unique parcels from geo-data system.
         Logic mirrors the working Genie query:
           - partition by `value`, order by `createDate` desc
           - keep rn = 1 (latest row for that value)
@@ -349,6 +349,7 @@ def create_server() -> FastMCP:
             report_id: str,
     ) -> Dict[str, Any]:
         """
+        Return full parcel report data from geo-data system. Takes a parcel_id and report_id as input.
         Single query:
           SELECT * FROM test.gold.gold_report
           WHERE report_id = ? AND value = ?
