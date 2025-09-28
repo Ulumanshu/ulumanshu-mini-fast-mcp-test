@@ -12,7 +12,11 @@ import io
 import logging
 import os
 from typing import Dict, List, Any, Optional
-
+import json
+import time
+from urllib.parse import urlencode
+import requests
+from databricks import sql as databricks_sql
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 from starlette.requests import Request
@@ -28,6 +32,21 @@ logger = logging.getLogger("ulumanshu-mcp")
 
 # ---------- OpenAI client ----------
 # Uses OPENAI_API_KEY from env (standard OpenAI SDK behavior)
+# --- NEW: minimal Databricks + Azure Function envs ---
+DATABRICKS_SERVER_HOSTNAME = os.getenv("DATABRICKS_SERVER_HOSTNAME")
+DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+
+
+# Only one schema-related env (since your column names are fixed below):
+# Set this to the *actual* parcel id column in test.gold.gold_report (e.g., "parcel_id" or "parcelId").
+GOLD_REPORT_PARCEL_ID_COLUMN = "value"
+GOLD_REPORT_TABLE = "test.gold.gold_report"
+COL_REPORT_ID = "report_id"
+COL_CREATE_DATE = "createDate"
+COL_LAYER_ID = "layerId"
+COL_FIELD_ID = "fieldId"
+
 openai_client = OpenAI()
 
 SERVER_INSTRUCTIONS = f"""
@@ -35,6 +54,38 @@ SERVER_INSTRUCTIONS = f"""
 Use `search` to find semantically relevant documents, `fetch` for full content, and `add_memory`
 to insert new text into the store at runtime.
 """
+
+
+def _db_connect():
+    missing = [k for k, v in {
+        "DATABRICKS_SERVER_HOSTNAME": DATABRICKS_SERVER_HOSTNAME,
+        "DATABRICKS_HTTP_PATH": DATABRICKS_HTTP_PATH,
+        "DATABRICKS_TOKEN": DATABRICKS_TOKEN,
+        "GOLD_REPORT_PARCELID_COLUMN": GOLD_REPORT_PARCEL_ID_COLUMN,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+    return databricks_sql.connect(
+        server_hostname=DATABRICKS_SERVER_HOSTNAME,
+        http_path=DATABRICKS_HTTP_PATH,
+        access_token=DATABRICKS_TOKEN,
+    )
+
+
+def _db_query_dicts(sql_text: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql_text, params)
+            cols = [c[0] for c in cur.description]
+            out = []
+            for row in cur.fetchall():
+                if isinstance(row, dict):
+                    out.append(row)
+                else:
+                    out.append({cols[i]: row[i] for i in range(len(cols))})
+            return out
+
 
 def ensure_vector_store_named(name: str) -> str:
     """
@@ -258,9 +309,96 @@ def create_server() -> FastMCP:
         }
 
     @mcp.tool()
-    async def multiply(x: int, y: int) -> int:
-        """Multiply two integers."""
-        return x * y
+    async def parcels_latest_unique(limit: Optional[int] = 500) -> Dict[str, Any]:
+        """
+        Return latest unique parcels.
+        - Interprets parcel_id as the `value` of rows where fieldId = 'parcel_id'
+        - Picks the most recent (by createDate) report per parcel_id
+        """
+        sql_text = f"""
+               WITH parcel_rows AS (
+                   SELECT
+                       value       AS parcel_id,
+                       {COL_REPORT_ID}   AS report_id,
+                       {COL_CREATE_DATE} AS createDate
+                   FROM {GOLD_REPORT_TABLE}
+                   WHERE {COL_FIELD_ID} = 'parcel_id' AND value IS NOT NULL
+               ),
+               ranked AS (
+                   SELECT
+                       parcel_id, report_id, createDate,
+                       ROW_NUMBER() OVER (PARTITION BY parcel_id ORDER BY createDate DESC) AS rn
+                   FROM parcel_rows
+               )
+               SELECT parcel_id, report_id, createDate
+               FROM ranked
+               WHERE rn = 1
+               ORDER BY parcel_id
+           """
+        rows = _db_query_dicts(sql_text)
+        if limit:
+            rows = rows[: int(limit)]
+        return {
+            "count": len(rows),
+            "parcels": rows  # [{parcel_id, report_id, createDate}]
+        }
+
+    @mcp.tool()
+    async def parcel_latest_full(parcel_id: str) -> Dict[str, Any]:
+        """
+        For a given parcel_id (as stored in `value` when fieldId='parcel_id'):
+          1) Find the latest report_id by createDate
+          2) Return ALL fields/layers for that report (no API calls)
+        """
+        # 1) find latest report for this parcel_id
+        sql_latest = f"""
+               SELECT report_id, createDate
+               FROM (
+                   SELECT
+                       {COL_REPORT_ID}   AS report_id,
+                       {COL_CREATE_DATE} AS createDate,
+                       ROW_NUMBER() OVER (ORDER BY {COL_CREATE_DATE} DESC) AS rn
+                   FROM {GOLD_REPORT_TABLE}
+                   WHERE {COL_FIELD_ID} = 'parcel_id' AND value = ?
+               ) t
+               WHERE rn = 1
+           """
+        latest = _db_query_dicts(sql_latest, (parcel_id,))
+        if not latest:
+            return {"parcel_id": parcel_id, "report_id": None, "createDate": None, "field_count": 0, "fields": []}
+
+        report_id = latest[0]["report_id"]
+        created_at = latest[0]["createDate"]
+
+        # 2) pull all fields/layers for that report
+        sql_fields = f"""
+               SELECT
+                   {COL_LAYER_ID}  AS layerId,
+                   {COL_FIELD_ID}  AS fieldId,
+                   description,
+                   value,
+                   attributes
+               FROM {GOLD_REPORT_TABLE}
+               WHERE {COL_REPORT_ID} = ?
+               ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
+           """
+        rows = _db_query_dicts(sql_fields, (report_id,))
+
+        # best-effort: parse JSON attributes if present
+        for r in rows:
+            try:
+                if r.get("attributes") is not None and isinstance(r["attributes"], str):
+                    r["attributes"] = json.loads(r["attributes"])
+            except Exception:
+                pass
+
+        return {
+            "parcel_id": parcel_id,
+            "report_id": report_id,
+            "createDate": created_at,
+            "field_count": len(rows),
+            "fields": rows
+        }
 
     return mcp
 
