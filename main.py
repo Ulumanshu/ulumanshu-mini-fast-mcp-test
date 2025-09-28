@@ -265,17 +265,12 @@ def create_server() -> FastMCP:
     return mcp
 
 
-def main():
-    """Start the Ulumanshu MCP Server (HTTP JSON-RPC at /mcp/)."""
-    # Gentle heads-up if the API key is missing; health route will still work.
-    if not os.environ.get("OPENAI_API_KEY"):
-        logger.warning("OPENAI_API_KEY not set — tools using OpenAI will fail until you set it.")
+# --- Expose server object(s) for FastMCP Cloud inspector ---
+mcp = create_server()   # primary export expected by the inspector
+server = mcp            # optional alias
+app = mcp               # optional alias
 
-    server = create_server()
-    logger.info("Starting Ulumanshu MCP Server on 0.0.0.0:8000 over HTTP")
-    logger.info("MCP endpoint: http://<host>:8000/mcp/  (use trailing slash in ChatGPT)")
-    server.run(transport="http", host="0.0.0.0", port=8000)
-
-
+# Local runner only; Cloud will manage the process
 if __name__ == "__main__":
-    main()
+    # Use 8080 if your platform expects that port; otherwise 8000 is fine.
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
