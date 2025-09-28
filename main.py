@@ -343,33 +343,38 @@ def create_server() -> FastMCP:
         return {"count": len(rows), "parcels": rows}
 
     @mcp.tool()
-    async def parcel_latest_full(parcel_id: str) -> Dict[str, Any]:
+    async def parcel_latest_full(parcel_id: str, report_id: str) -> Dict[str, Any]:
         """
-        For a given parcel_id (stored in `value`):
-          1) Find the latest report_id by createDate among rows with value = parcel_id
-          2) Return ALL fields/layers for that report (no API calls)
+        For a given parcel_id (stored in `value`) and a report_id:
+          - Best-effort verify the parcel/report pair exists in the table
+          - Return ALL fields/layers for that report (Databricks SQL only)
         """
-        # 1) latest report for this parcel (by createDate)
-        sql_latest = f"""
-            SELECT {COL_REPORT_ID} AS report_id, {COL_CREATE_DATE} AS createDate
+
+        # Optional: verify that this report contains a row for the parcel_id (via value column)
+        sql_verify = f"""
+            SELECT 1
             FROM {GOLD_REPORT_TABLE}
-            WHERE value = ?
-              AND {COL_CREATE_DATE} IS NOT NULL
-            ORDER BY {COL_CREATE_DATE} DESC
+            WHERE {COL_REPORT_ID} = ?
+              AND value = ?
             LIMIT 1
         """
-        latest = _db_query_dicts(sql_latest, (parcel_id,))
-        if not latest:
-            return {"parcel_id": parcel_id, "report_id": None, "createDate": None, "field_count": 0, "fields": []}
+        verify = _db_query_dicts(sql_verify, (report_id, parcel_id))
+        warning = None if verify else f"parcel_id '{parcel_id}' not found in report_id '{report_id}' (value column)."
 
-        report_id = latest[0]["report_id"]
-        created_at = latest[0]["createDate"]
+        # Pull a representative createDate for the report (max across rows in that report)
+        sql_report_date = f"""
+            SELECT MAX({COL_CREATE_DATE}) AS createDate
+            FROM {GOLD_REPORT_TABLE}
+            WHERE {COL_REPORT_ID} = ?
+        """
+        date_row = _db_query_dicts(sql_report_date, (report_id,))
+        created_at = (date_row[0]["createDate"] if date_row and "createDate" in date_row[0] else None)
 
-        # 2) pull all fields for that report
+        # Return ALL fields/layers for that report
         sql_fields = f"""
             SELECT
-                {COL_LAYER_ID}  AS layerId,
-                {COL_FIELD_ID}  AS fieldId,
+                {COL_LAYER_ID} AS layerId,
+                {COL_FIELD_ID} AS fieldId,
                 description,
                 value,
                 attributes
@@ -392,7 +397,8 @@ def create_server() -> FastMCP:
             "report_id": report_id,
             "createDate": created_at,
             "field_count": len(rows),
-            "fields": rows
+            "fields": rows,
+            **({"warning": warning} if warning else {}),
         }
 
     return mcp
