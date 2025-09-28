@@ -308,61 +308,56 @@ def create_server() -> FastMCP:
             "bytes": len(file_bytes),
         }
 
+    # -----------------------------
+    # NEW TOOLS (Databricks-only; parcel_id lives in `value`)
+    # -----------------------------
+
     @mcp.tool()
-    async def parcels_latest_unique(limit: Optional[int] = 500) -> Dict[str, Any]:
+    async def parcels_latest_unique(limit: Optional[int] = 20) -> Dict[str, Any]:
         """
-        Return latest unique parcels.
-        - Interprets parcel_id as the `value` of rows where fieldId = 'parcel_id'
-        - Picks the most recent (by createDate) report per parcel_id
+        Return latest-unique parcels.
+        Logic mirrors the working Genie query:
+          - partition by `value`, order by `createDate` desc
+          - keep rn = 1 (latest row for that value)
+        Outputs: [{parcel_id, report_id, createDate}], ordered by createDate desc.
         """
         sql_text = f"""
-               WITH parcel_rows AS (
-                   SELECT
-                       value       AS parcel_id,
-                       {COL_REPORT_ID}   AS report_id,
-                       {COL_CREATE_DATE} AS createDate
-                   FROM {GOLD_REPORT_TABLE}
-                   WHERE {COL_FIELD_ID} = 'parcel_id' AND value IS NOT NULL
-               ),
-               ranked AS (
-                   SELECT
-                       parcel_id, report_id, createDate,
-                       ROW_NUMBER() OVER (PARTITION BY parcel_id ORDER BY createDate DESC) AS rn
-                   FROM parcel_rows
-               )
-               SELECT parcel_id, report_id, createDate
-               FROM ranked
-               WHERE rn = 1
-               ORDER BY parcel_id
-           """
+            WITH ranked AS (
+                SELECT
+                    value                 AS parcel_id,
+                    {COL_REPORT_ID}       AS report_id,
+                    {COL_CREATE_DATE}     AS createDate,
+                    ROW_NUMBER() OVER (PARTITION BY value ORDER BY {COL_CREATE_DATE} DESC) AS rn
+                FROM {GOLD_REPORT_TABLE}
+                WHERE value IS NOT NULL
+                  AND {COL_CREATE_DATE} IS NOT NULL
+            )
+            SELECT parcel_id, report_id, createDate
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY createDate DESC
+        """
         rows = _db_query_dicts(sql_text)
         if limit:
             rows = rows[: int(limit)]
-        return {
-            "count": len(rows),
-            "parcels": rows  # [{parcel_id, report_id, createDate}]
-        }
+        return {"count": len(rows), "parcels": rows}
 
     @mcp.tool()
     async def parcel_latest_full(parcel_id: str) -> Dict[str, Any]:
         """
-        For a given parcel_id (as stored in `value` when fieldId='parcel_id'):
-          1) Find the latest report_id by createDate
+        For a given parcel_id (stored in `value`):
+          1) Find the latest report_id by createDate among rows with value = parcel_id
           2) Return ALL fields/layers for that report (no API calls)
         """
-        # 1) find latest report for this parcel_id
+        # 1) latest report for this parcel (by createDate)
         sql_latest = f"""
-               SELECT report_id, createDate
-               FROM (
-                   SELECT
-                       {COL_REPORT_ID}   AS report_id,
-                       {COL_CREATE_DATE} AS createDate,
-                       ROW_NUMBER() OVER (ORDER BY {COL_CREATE_DATE} DESC) AS rn
-                   FROM {GOLD_REPORT_TABLE}
-                   WHERE {COL_FIELD_ID} = 'parcel_id' AND value = ?
-               ) t
-               WHERE rn = 1
-           """
+            SELECT {COL_REPORT_ID} AS report_id, {COL_CREATE_DATE} AS createDate
+            FROM {GOLD_REPORT_TABLE}
+            WHERE value = ?
+              AND {COL_CREATE_DATE} IS NOT NULL
+            ORDER BY {COL_CREATE_DATE} DESC
+            LIMIT 1
+        """
         latest = _db_query_dicts(sql_latest, (parcel_id,))
         if not latest:
             return {"parcel_id": parcel_id, "report_id": None, "createDate": None, "field_count": 0, "fields": []}
@@ -370,24 +365,24 @@ def create_server() -> FastMCP:
         report_id = latest[0]["report_id"]
         created_at = latest[0]["createDate"]
 
-        # 2) pull all fields/layers for that report
+        # 2) pull all fields for that report
         sql_fields = f"""
-               SELECT
-                   {COL_LAYER_ID}  AS layerId,
-                   {COL_FIELD_ID}  AS fieldId,
-                   description,
-                   value,
-                   attributes
-               FROM {GOLD_REPORT_TABLE}
-               WHERE {COL_REPORT_ID} = ?
-               ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
-           """
+            SELECT
+                {COL_LAYER_ID}  AS layerId,
+                {COL_FIELD_ID}  AS fieldId,
+                description,
+                value,
+                attributes
+            FROM {GOLD_REPORT_TABLE}
+            WHERE {COL_REPORT_ID} = ?
+            ORDER BY {COL_LAYER_ID}, {COL_FIELD_ID}
+        """
         rows = _db_query_dicts(sql_fields, (report_id,))
 
-        # best-effort: parse JSON attributes if present
+        # best-effort: parse JSON attributes if they are strings
         for r in rows:
             try:
-                if r.get("attributes") is not None and isinstance(r["attributes"], str):
+                if isinstance(r.get("attributes"), str):
                     r["attributes"] = json.loads(r["attributes"])
             except Exception:
                 pass
